@@ -1,0 +1,4 @@
+interface:
+  display_name: "Android Code Review"
+  short_description: "High-bar Android/Kotlin production code reviews"
+  default_prompt: "Use $android-code-review to review my Android changes."
