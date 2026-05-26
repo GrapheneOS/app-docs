@@ -1,0 +1,8 @@
+{
+  "_comment": "Manual fills for licenses where the artifact ships no LICENSE/NOTICE and the SPDX canonical text contains a copyright placeholder. Keys: exact 'group:name:version' OR 'group:name' (any version) OR 'group:*'. Match precedence is exact -> module -> group.",
+
+  "com.github.bumptech.glide:*": {
+    "copyright": "Copyright 2014 Google, Inc. All rights reserved.",
+    "source_of_truth": "https://github.com/bumptech/glide/blob/master/LICENSE"
+  }
+}
