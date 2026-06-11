@@ -18,6 +18,12 @@ It makes Gradle proactively resolve every artifact class that has to be verified
 - javadoc artifacts used by Android Studio
 - plain Maven `sources` and `javadoc` classifier artifacts requested by IDE detached
   configurations
+- documentation artifacts declared by Gradle module metadata, including Gradle plugin API
+  variant classifiers such as `gradle813-sources`
+- `buildSrc` build-logic artifacts, including sources requested by Android Studio for
+  `:buildSrc:compileClasspath`
+- Gradle embedded Groovy module metadata and sources requested from Gradle's internal
+  libraries repository during IDE sync
 - known host build-tool artifacts requested by detached configurations, such as platform-specific
   `aapt2` jars and KSP embeddable processing artifacts
 - the Gradle source distribution zip for the currently running Gradle version
@@ -68,9 +74,10 @@ The update command:
 1. preserves the existing verification configuration block
 2. rewrites `<components>` to an empty block
 3. uses Gradle's built-in `--write-verification-metadata sha512` mode
-4. resolves normal artifacts, dependency metadata, Gradle documentation variants, plain
-   source/javadoc classifiers, known detached host-tool artifacts, and the Gradle source
-   distribution
+4. resolves normal artifacts, dependency metadata, Gradle documentation variants, Gradle
+   module metadata documentation artifacts, buildSrc build-logic artifacts, plain
+   source/javadoc classifiers, Gradle embedded Groovy artifacts, known detached host-tool
+   artifacts, and the Gradle source distribution
 
 The init script recognizes Gradle's normal prefix and camel-case task abbreviations for its own
 resolver and check tasks, so abbreviated invocations still apply the pre-settings clean rewrite,
@@ -97,8 +104,9 @@ selected external module and every exact requested external module selector disc
 buildscript and project configurations, using the same repository scope as the configuration that
 found the module. Requested selectors matter because Gradle can verify metadata for candidates
 that are later rejected by conflict resolution. The script also parses resolved POMs and Gradle
-module metadata, recursively resolving parent POMs, imported BOM POMs, and platform dependencies
-declared in Gradle module metadata, because those metadata-only files can be verified by Gradle
+module metadata, recursively resolving parent POMs, imported BOM POMs, dependencies declared in
+Gradle module metadata, and documentation artifacts declared by Gradle module metadata, because
+those metadata-only files and metadata-selected documentation variants can be verified by Gradle
 without appearing as normal dependency artifacts.
 
 Some Android plugin configurations are marked resolvable but are only valid inside their owning
@@ -108,6 +116,11 @@ configuration and reports the fallback in the final summary. Dependency verifica
 never converted to fallback resolution. The update command cannot be combined with `--dry-run`:
 cleaning metadata is only safe when the resolver task actually executes and Gradle can regenerate
 the component hashes.
+
+When a repository has `buildSrc`, the update command runs a contained nested `buildSrc`
+verification-metadata pass and then resolves documentation artifacts for those build-logic
+components into the root metadata. The temporary `buildSrc/gradle/verification-metadata.xml` file
+is deleted or restored after the nested pass.
 
 The resolver and check tasks intentionally inspect configurations across projects at execution
 time, so the init script rejects invocations where Gradle's configuration cache is requested. Keep

@@ -1,3 +1,4 @@
+import groovy.lang.GroovySystem
 import groovy.json.JsonSlurper
 import java.io.File
 import java.io.IOException
@@ -46,6 +47,7 @@ import org.xml.sax.InputSource
 import org.xml.sax.SAXException
 
 private object ScriptConfig {
+    const val SCRIPT_FILE_NAME = "gradle-dependency-verification-artifacts.init.gradle.kts"
     const val RESOLVE_TASK_NAME = "resolveDependencyVerificationArtifacts"
     const val CHECK_TASK_NAME = "checkDependencyVerificationHashes"
     const val CLEAN_METADATA_PROPERTY_NAME = "cleanDependencyVerificationMetadata"
@@ -330,6 +332,54 @@ private fun parseComponentsBlockCount(
     }
 }
 
+private fun parseVerificationMetadataComponents(metadataFile: File): Set<ModuleCoordinate> {
+    if (!metadataFile.isFile) {
+        return emptySet()
+    }
+
+    val document = try {
+        verificationMetadataDocumentBuilderFactory()
+            .newDocumentBuilder()
+            .parse(metadataFile)
+    } catch (exception: ParserConfigurationException) {
+        throw GradleException(
+            "Could not configure XML parser for ${metadataFile.absolutePath}",
+            exception,
+        )
+    } catch (exception: SAXException) {
+        throw GradleException("Could not parse ${metadataFile.absolutePath}", exception)
+    } catch (exception: IOException) {
+        throw GradleException("Could not read ${metadataFile.absolutePath}", exception)
+    }
+
+    val root = document.documentElement
+    if (
+        root.localName != "verification-metadata" ||
+        root.namespaceURI != ScriptConfig.DEPENDENCY_VERIFICATION_NAMESPACE
+    ) {
+        throw GradleException(
+            "Unexpected dependency verification metadata root in ${metadataFile.absolutePath}",
+        )
+    }
+
+    return root.directChildElements("components")
+        .flatMap { components -> components.directChildElements("component") }
+        .mapNotNull { component ->
+            val group = component.getAttribute("group").takeIf { it.isNotEmpty() }
+                ?: return@mapNotNull null
+            val module = component.getAttribute("name").takeIf { it.isNotEmpty() }
+                ?: return@mapNotNull null
+            val version = component.getAttribute("version").takeIf { it.isNotEmpty() }
+                ?: return@mapNotNull null
+            ModuleCoordinate(
+                group = group,
+                module = module,
+                version = version,
+            )
+        }
+        .toSet()
+}
+
 private fun lineSeparator(contents: String): String {
     return if (contents.contains("\r\n")) "\r\n" else "\n"
 }
@@ -469,6 +519,8 @@ private class ResolveStats {
     var dependencyMetadataArtifactCount: Int = 0
     var sourceClassifierArtifactCount: Int = 0
     var javadocClassifierArtifactCount: Int = 0
+    var metadataDocumentationArtifactCount: Int = 0
+    var gradleEmbeddedLibraryArtifactCount: Int = 0
     var hostToolArtifactCount: Int = 0
     var gradleSourceDistributionCount: Int = 0
 }
@@ -541,6 +593,16 @@ private data class ModuleRequest(
     val jvmEnvironments: Set<String>,
 )
 
+private data class ModuleMetadataDocumentationArtifact(
+    val classifier: String,
+    val docsType: String,
+)
+
+private data class ParsedGradleModuleMetadata(
+    val dependencies: Set<ModuleCoordinate>,
+    val documentationArtifacts: Set<ModuleMetadataDocumentationArtifact>,
+)
+
 private enum class ConfigurationOwner(
     val label: String,
 ) {
@@ -578,6 +640,13 @@ private data class ScopedModuleCoordinateKey(
     val projectPath: String,
     val owner: ConfigurationOwner,
     val coordinate: ModuleCoordinate,
+)
+
+private data class ScopedDocumentationArtifactKey(
+    val projectPath: String,
+    val owner: ConfigurationOwner,
+    val coordinate: ModuleCoordinate,
+    val classifier: String,
 )
 
 private data class ResolvedDetachedArtifacts(
@@ -858,19 +927,53 @@ private fun moduleMetadataDependencyCoordinate(
     dependency: Any?,
 ): ModuleCoordinate? {
     val dependencyMap = dependency as? Map<*, *> ?: return null
-    val attributes = dependencyMap["attributes"] as? Map<*, *>
-    val category = attributes?.get("org.gradle.category") as? String
-    if (category != Category.REGULAR_PLATFORM && category != Category.ENFORCED_PLATFORM) {
-        return null
-    }
-
     val group = dependencyMap["group"] as? String ?: return null
     val module = dependencyMap["module"] as? String ?: return null
     val version = moduleMetadataVersion(dependencyMap["version"]) ?: return null
     return ModuleCoordinate(group = group, module = module, version = version)
 }
 
-private fun parseGradleModuleMetadata(moduleMetadataFile: File): Set<ModuleCoordinate> {
+private fun moduleMetadataDocumentationArtifact(
+    currentModule: ModuleCoordinate,
+    variant: Map<*, *>,
+    file: Any?,
+): ModuleMetadataDocumentationArtifact? {
+    val attributes = variant["attributes"] as? Map<*, *> ?: return null
+    if (attributes["org.gradle.category"] != Category.DOCUMENTATION) {
+        return null
+    }
+
+    val docsType = attributes["org.gradle.docstype"] as? String ?: return null
+    if (docsType != DocsType.SOURCES && docsType != DocsType.JAVADOC) {
+        return null
+    }
+
+    val fileMap = file as? Map<*, *> ?: return null
+    val name = (fileMap["name"] as? String) ?: (fileMap["url"] as? String) ?: return null
+    if (!name.endsWith(".jar")) {
+        return null
+    }
+
+    val prefix = "${currentModule.module}-${currentModule.version}-"
+    if (!name.startsWith(prefix)) {
+        return null
+    }
+
+    val classifier = name
+        .removePrefix(prefix)
+        .removeSuffix(".jar")
+        .takeIf { it.isNotEmpty() }
+        ?: return null
+    return ModuleMetadataDocumentationArtifact(
+        classifier = classifier,
+        docsType = docsType,
+    )
+}
+
+private fun parseGradleModuleMetadata(
+    moduleMetadataFile: File,
+    currentModule: ModuleCoordinate,
+): ParsedGradleModuleMetadata {
     val metadata = try {
         JsonSlurper().parse(moduleMetadataFile)
     } catch (exception: Exception) {
@@ -880,15 +983,41 @@ private fun parseGradleModuleMetadata(moduleMetadataFile: File): Set<ModuleCoord
         )
     }
 
-    val root = metadata as? Map<*, *> ?: return emptySet()
-    val variants = root["variants"] as? Iterable<*> ?: return emptySet()
-    return variants
+    val root = metadata as? Map<*, *> ?: return ParsedGradleModuleMetadata(
+        dependencies = emptySet(),
+        documentationArtifacts = emptySet(),
+    )
+    val variants = root["variants"] as? Iterable<*> ?: return ParsedGradleModuleMetadata(
+        dependencies = emptySet(),
+        documentationArtifacts = emptySet(),
+    )
+
+    val dependencies = variants
         .flatMap { variant ->
             val variantMap = variant as? Map<*, *> ?: return@flatMap emptyList()
             val dependencies = variantMap["dependencies"] as? Iterable<*> ?: emptyList<Any>()
             dependencies.mapNotNull(::moduleMetadataDependencyCoordinate)
         }
         .toSet()
+
+    val documentationArtifacts = variants
+        .flatMap { variant ->
+            val variantMap = variant as? Map<*, *> ?: return@flatMap emptyList()
+            val files = variantMap["files"] as? Iterable<*> ?: emptyList<Any>()
+            files.mapNotNull { file ->
+                moduleMetadataDocumentationArtifact(
+                    currentModule = currentModule,
+                    variant = variantMap,
+                    file = file,
+                )
+            }
+        }
+        .toSet()
+
+    return ParsedGradleModuleMetadata(
+        dependencies = dependencies,
+        documentationArtifacts = documentationArtifacts,
+    )
 }
 
 private fun resolvePrimaryArtifacts(configuration: Configuration) {
@@ -1218,6 +1347,87 @@ private fun resolveClassifierDocumentationArtifactCount(
     return files.size
 }
 
+private fun resolveMetadataDocumentationArtifactCount(
+    project: Project,
+    owner: ConfigurationOwner,
+    module: ModuleCoordinate,
+    artifact: ModuleMetadataDocumentationArtifact,
+): Int {
+    logger.info(
+        "Resolving ${project.path}:${owner.label} metadata documentation artifact " +
+            module.notation(":${artifact.classifier}@jar"),
+    )
+    val request = ModuleRequest(
+        coordinate = module,
+        jvmEnvironments = emptySet(),
+    )
+    return resolveClassifierDocumentationArtifactCount(
+        project = project,
+        owner = owner,
+        request = request,
+        classifier = artifact.classifier,
+    )
+}
+
+private fun resolveOptionalMetadataDocumentationArtifactCount(
+    project: Project,
+    owner: ConfigurationOwner,
+    module: ModuleCoordinate,
+    artifact: ModuleMetadataDocumentationArtifact,
+): Int {
+    return try {
+        resolveMetadataDocumentationArtifactCount(
+            project = project,
+            owner = owner,
+            module = module,
+            artifact = artifact,
+        )
+    } catch (exception: Exception) {
+        if (exception.isDependencyVerificationFailure()) {
+            throw exception
+        }
+
+        logger.info(
+            "Skipping optional metadata documentation artifact " +
+                module.notation(":${artifact.classifier}@jar") +
+                " because it could not be resolved.",
+            exception,
+        )
+        0
+    }
+}
+
+private fun resolveMetadataDocumentationArtifactOnce(
+    project: Project,
+    owner: ConfigurationOwner,
+    module: ModuleCoordinate,
+    artifact: ModuleMetadataDocumentationArtifact,
+    resolvedDocumentationArtifacts: MutableSet<ScopedDocumentationArtifactKey>,
+    stats: ResolveStats,
+) {
+    val key = ScopedDocumentationArtifactKey(
+        projectPath = project.path,
+        owner = owner,
+        coordinate = module,
+        classifier = artifact.classifier,
+    )
+    if (!resolvedDocumentationArtifacts.add(key)) {
+        return
+    }
+
+    val resolvedArtifactCount = resolveOptionalMetadataDocumentationArtifactCount(
+        project = project,
+        owner = owner,
+        module = module,
+        artifact = artifact,
+    )
+    stats.metadataDocumentationArtifactCount += resolvedArtifactCount
+    when (artifact.docsType) {
+        DocsType.SOURCES -> stats.sourceClassifierArtifactCount += resolvedArtifactCount
+        DocsType.JAVADOC -> stats.javadocClassifierArtifactCount += resolvedArtifactCount
+    }
+}
+
 private fun resolveOptionalModuleArtifactFiles(
     project: Project,
     owner: ConfigurationOwner,
@@ -1247,15 +1457,13 @@ private fun resolveOptionalModuleArtifactFiles(
         }
     }
 
-    val cause = failures.lastOrNull()
-    throw GradleException(
-        "Could not resolve optional dependency metadata artifact " +
+    logger.info(
+        "Skipping optional dependency metadata artifact " +
             module.notation("@$extension") +
-            " with any supported attribute profile.",
-        cause,
-    ).also { exception ->
-        failures.dropLast(1).forEach { failure -> exception.addSuppressed(failure) }
-    }
+            " because it could not be resolved with any supported attribute profile.",
+        failures.lastOrNull(),
+    )
+    return emptySet()
 }
 
 private fun resolveOptionalModuleArtifactFiles(
@@ -1335,6 +1543,7 @@ private fun resolveDependencyMetadataArtifacts(
     }
 
     val seen = mutableSetOf<ScopedModuleCoordinateKey>()
+    val resolvedDocumentationArtifacts = mutableSetOf<ScopedDocumentationArtifactKey>()
     while (!pending.isEmpty()) {
         val request = pending.removeFirst()
         val key = ScopedModuleCoordinateKey(
@@ -1370,10 +1579,50 @@ private fun resolveDependencyMetadataArtifacts(
         )
         stats.dependencyMetadataArtifactCount += pomFiles.size
 
-        val moduleMetadataCoordinates = moduleMetadataFiles
-            .flatMap { moduleMetadataFile ->
-                parseGradleModuleMetadata(moduleMetadataFile)
+        listOf(
+            ModuleMetadataDocumentationArtifact(
+                classifier = "sources",
+                docsType = DocsType.SOURCES,
+            ),
+            ModuleMetadataDocumentationArtifact(
+                classifier = "javadoc",
+                docsType = DocsType.JAVADOC,
+            ),
+        ).forEach { artifact ->
+            resolveMetadataDocumentationArtifactOnce(
+                project = request.project,
+                owner = request.owner,
+                module = request.coordinate,
+                artifact = artifact,
+                resolvedDocumentationArtifacts = resolvedDocumentationArtifacts,
+                stats = stats,
+            )
+        }
+
+        val parsedModuleMetadata = moduleMetadataFiles.map { moduleMetadataFile ->
+            parseGradleModuleMetadata(
+                moduleMetadataFile = moduleMetadataFile,
+                currentModule = request.coordinate,
+            )
+        }
+        parsedModuleMetadata
+            .flatMap { moduleMetadata -> moduleMetadata.documentationArtifacts }
+            .sortedWith(
+                compareBy<ModuleMetadataDocumentationArtifact> { it.docsType }
+                    .thenBy { it.classifier },
+            )
+            .forEach { artifact ->
+                resolveMetadataDocumentationArtifactOnce(
+                    project = request.project,
+                    owner = request.owner,
+                    module = request.coordinate,
+                    artifact = artifact,
+                    resolvedDocumentationArtifacts = resolvedDocumentationArtifacts,
+                    stats = stats,
+                )
             }
+        val moduleMetadataCoordinates = parsedModuleMetadata
+            .flatMap { moduleMetadata -> moduleMetadata.dependencies }
         val pomMetadataCoordinates = pomFiles
             .flatMap { pomFile ->
                 parseMavenPomMetadata(
@@ -1424,6 +1673,87 @@ private fun resolveGradleSourceDistribution(project: Project) {
         project.withProjectGradleDistributionsRepository(::resolve)
     } else {
         resolve()
+    }
+}
+
+private fun resolveGradleEmbeddedGroovyModule(
+    project: Project,
+    stats: ResolveStats,
+    module: ModuleCoordinate,
+) {
+    val moduleMetadataFiles = resolveOptionalModuleArtifactFiles(
+        project = project,
+        owner = ConfigurationOwner.PROJECT,
+        module = module,
+        extension = "module",
+    )
+    val pomFiles = resolveOptionalModuleArtifactFiles(
+        project = project,
+        owner = ConfigurationOwner.PROJECT,
+        module = module,
+        extension = "pom",
+    )
+    val request = ModuleRequest(
+        coordinate = module,
+        jvmEnvironments = emptySet(),
+    )
+    val sourceArtifactCount = resolveClassifierDocumentationArtifactCount(
+        project = project,
+        owner = ConfigurationOwner.PROJECT,
+        request = request,
+        classifier = "sources",
+    )
+    val javadocArtifactCount = resolveClassifierDocumentationArtifactCount(
+        project = project,
+        owner = ConfigurationOwner.PROJECT,
+        request = request,
+        classifier = "javadoc",
+    )
+
+    stats.dependencyMetadataArtifactCount += moduleMetadataFiles.size + pomFiles.size
+    stats.sourceClassifierArtifactCount += sourceArtifactCount
+    stats.javadocClassifierArtifactCount += javadocArtifactCount
+    stats.gradleEmbeddedLibraryArtifactCount +=
+        moduleMetadataFiles.size + pomFiles.size + sourceArtifactCount + javadocArtifactCount
+}
+
+private fun gradleEmbeddedGroovyModules(): List<ModuleCoordinate> {
+    val groovyVersion = GroovySystem.getVersion()
+    val groovyJar = File(
+        GroovySystem::class.java.protectionDomain.codeSource.location.toURI(),
+    )
+    val groovyLibraryDirectory = groovyJar.parentFile ?: return listOf(
+        ModuleCoordinate(
+            group = "org.apache.groovy",
+            module = "groovy",
+            version = groovyVersion,
+        ),
+    )
+    val groovyJarNameRegex = Regex("""(groovy(?:-[A-Za-z0-9]+)?)-${Regex.escape(groovyVersion)}\.jar""")
+
+    return groovyLibraryDirectory.listFiles()
+        .orEmpty()
+        .mapNotNull { file ->
+            val module = groovyJarNameRegex.matchEntire(file.name)?.groupValues?.get(1)
+                ?: return@mapNotNull null
+            ModuleCoordinate(
+                group = "org.apache.groovy",
+                module = module,
+                version = groovyVersion,
+            )
+        }
+        .distinct()
+        .sortedBy { module -> module.module }
+}
+
+private fun resolveGradleEmbeddedGroovyArtifacts(project: Project, stats: ResolveStats) {
+    gradleEmbeddedGroovyModules().forEach { module ->
+        logger.info("Resolving Gradle embedded Groovy artifacts for ${module.notation()}")
+        resolveGradleEmbeddedGroovyModule(
+            project = project,
+            stats = stats,
+            module = module,
+        )
     }
 }
 
@@ -1676,6 +2006,115 @@ private fun resolveProjectConfigurations(
     )
 }
 
+private fun seedExistingVerificationMetadataComponents(
+    project: Project,
+    moduleRequests: MutableMap<ModuleRequestScope, ScopedModuleRequests>,
+) {
+    val metadataFile = project.rootProject.projectDir.resolve(ScriptConfig.METADATA_PATH)
+    val requests = parseVerificationMetadataComponents(metadataFile)
+        .associateWith { coordinate ->
+            ModuleRequest(
+                coordinate = coordinate,
+                jvmEnvironments = emptySet(),
+            )
+        }
+
+    if (requests.isEmpty()) {
+        return
+    }
+
+    moduleRequests.merge(
+        project = project.rootProject,
+        owner = ConfigurationOwner.BUILDSCRIPT,
+        requests = requests,
+    )
+    moduleRequests.merge(
+        project = project.rootProject,
+        owner = ConfigurationOwner.PROJECT,
+        requests = requests,
+    )
+}
+
+private fun minimalVerificationMetadata(): String {
+    return """
+        |<?xml version="1.0" encoding="UTF-8"?>
+        |<verification-metadata xmlns="${ScriptConfig.DEPENDENCY_VERIFICATION_NAMESPACE}">
+        |   <components>
+        |   </components>
+        |</verification-metadata>
+        |
+    """.trimMargin()
+}
+
+private fun currentInitScriptFile(): File {
+    return gradle.startParameter.allInitScripts.firstOrNull { initScript ->
+        initScript.name == ScriptConfig.SCRIPT_FILE_NAME
+    } ?: throw GradleException(
+        "Could not find ${ScriptConfig.SCRIPT_FILE_NAME} in Gradle init scripts",
+    )
+}
+
+private fun Project.resolveBuildSrcVerificationMetadataComponents(): Set<ModuleCoordinate> {
+    if (!writeVerificationMetadataRequested || rootProject.projectDir.name == "buildSrc") {
+        return emptySet()
+    }
+
+    val buildSrcDir = rootProject.projectDir.resolve("buildSrc")
+    if (!buildSrcDir.isDirectory) {
+        return emptySet()
+    }
+
+    val wrapper = rootProject.projectDir.resolve(
+        if (System.getProperty("os.name").startsWith("Windows")) "gradlew.bat" else "gradlew",
+    )
+    if (!wrapper.isFile) {
+        return emptySet()
+    }
+
+    val metadataFile = buildSrcDir.resolve(ScriptConfig.METADATA_PATH)
+    val metadataDirectory = metadataFile.parentFile
+    val metadataDirectoryExisted = metadataDirectory.isDirectory
+    val originalMetadata = metadataFile.takeIf { it.isFile }?.readText(Charsets.UTF_8)
+    metadataDirectory.mkdirs()
+    metadataFile.writeText(minimalVerificationMetadata(), Charsets.UTF_8)
+
+    try {
+        val writeVerificationMetadata =
+            gradle.startParameter.writeDependencyVerifications.joinToString(",")
+        val process = ProcessBuilder(
+            wrapper.absolutePath,
+            "--no-daemon",
+            "--no-configuration-cache",
+            "-I",
+            currentInitScriptFile().absolutePath,
+            "--write-verification-metadata",
+            writeVerificationMetadata,
+            ScriptConfig.RESOLVE_TASK_NAME,
+        )
+            .directory(buildSrcDir)
+            .redirectErrorStream(true)
+            .start()
+        val output = process.inputStream.bufferedReader().readText()
+        val exitCode = process.waitFor()
+        if (exitCode != 0) {
+            throw GradleException(
+                "Could not resolve buildSrc dependency verification artifacts.\n$output",
+            )
+        }
+
+        return parseVerificationMetadataComponents(metadataFile)
+    } finally {
+        if (originalMetadata != null) {
+            metadataFile.writeText(originalMetadata, Charsets.UTF_8)
+        } else {
+            metadataFile.delete()
+            if (!metadataDirectoryExisted) {
+                metadataDirectory.delete()
+            }
+        }
+    }
+}
+
 private fun Project.registerDependencyVerificationResolverTask(
     taskName: String,
     taskDescription: String,
@@ -1696,6 +2135,24 @@ private fun Project.registerDependencyVerificationResolverTask(
             rootProject.allprojects.sortedBy { it.path }.forEach { project ->
                 resolveProjectConfigurations(project, moduleRequests, stats)
             }
+            val buildSrcRequests = resolveBuildSrcVerificationMetadataComponents()
+                .associateWith { coordinate ->
+                    ModuleRequest(
+                        coordinate = coordinate,
+                        jvmEnvironments = emptySet(),
+                    )
+                }
+            moduleRequests.merge(
+                project = rootProject,
+                owner = ConfigurationOwner.BUILDSCRIPT,
+                requests = buildSrcRequests,
+            )
+            moduleRequests.merge(
+                project = rootProject,
+                owner = ConfigurationOwner.PROJECT,
+                requests = buildSrcRequests,
+            )
+            seedExistingVerificationMetadataComponents(rootProject, moduleRequests)
 
             resolveClassifierDocumentationArtifacts(
                 scopedRequests = moduleRequests.values,
@@ -1712,6 +2169,8 @@ private fun Project.registerDependencyVerificationResolverTask(
                 stats = stats,
             )
 
+            resolveGradleEmbeddedGroovyArtifacts(rootProject, stats)
+
             logger.info("Resolving Gradle ${rootProject.gradle.gradleVersion} source distribution")
             resolveGradleSourceDistribution(rootProject)
             stats.gradleSourceDistributionCount += 1
@@ -1725,6 +2184,10 @@ private fun Project.registerDependencyVerificationResolverTask(
                     "dependency metadata artifact(s), " +
                     "${stats.sourceClassifierArtifactCount} source classifier artifact(s), " +
                     "${stats.javadocClassifierArtifactCount} javadoc classifier artifact(s), " +
+                    "${stats.metadataDocumentationArtifactCount} " +
+                    "metadata documentation artifact(s), " +
+                    "${stats.gradleEmbeddedLibraryArtifactCount} " +
+                    "Gradle embedded library artifact(s), " +
                     "${stats.hostToolArtifactCount} host tool artifact(s), " +
                     "${stats.gradleSourceDistributionCount} Gradle source distribution(s).",
             )
