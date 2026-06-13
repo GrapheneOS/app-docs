@@ -332,9 +332,14 @@ private fun parseComponentsBlockCount(
     }
 }
 
-private fun parseVerificationMetadataComponents(metadataFile: File): Set<ModuleCoordinate> {
+private data class PinnedComponent(
+    val coordinate: ModuleCoordinate,
+    val artifactNames: List<String>,
+)
+
+private fun parseVerificationMetadataPinnedComponents(metadataFile: File): List<PinnedComponent> {
     if (!metadataFile.isFile) {
-        return emptySet()
+        return emptyList()
     }
 
     val document = try {
@@ -371,12 +376,24 @@ private fun parseVerificationMetadataComponents(metadataFile: File): Set<ModuleC
                 ?: return@mapNotNull null
             val version = component.getAttribute("version").takeIf { it.isNotEmpty() }
                 ?: return@mapNotNull null
-            ModuleCoordinate(
-                group = group,
-                module = module,
-                version = version,
+            val artifactNames = component.directChildElements("artifact")
+                .mapNotNull { artifact ->
+                    artifact.getAttribute("name").takeIf { it.isNotEmpty() }
+                }
+            PinnedComponent(
+                coordinate = ModuleCoordinate(
+                    group = group,
+                    module = module,
+                    version = version,
+                ),
+                artifactNames = artifactNames,
             )
         }
+}
+
+private fun parseVerificationMetadataComponents(metadataFile: File): Set<ModuleCoordinate> {
+    return parseVerificationMetadataPinnedComponents(metadataFile)
+        .map { component -> component.coordinate }
         .toSet()
 }
 
@@ -523,6 +540,7 @@ private class ResolveStats {
     var gradleEmbeddedLibraryArtifactCount: Int = 0
     var hostToolArtifactCount: Int = 0
     var gradleSourceDistributionCount: Int = 0
+    var pinnedVerificationArtifactCount: Int = 0
 }
 
 private data class ModuleId(
@@ -2006,33 +2024,159 @@ private fun resolveProjectConfigurations(
     )
 }
 
-private fun seedExistingVerificationMetadataComponents(
+/**
+ * Derives the Gradle artifact-only notation for a pinned artifact file name so it
+ * can be re-resolved exactly as recorded. Returns null when the file name does not
+ * follow the `<module>-<version>[-<classifier>].<ext>` convention, in which case the
+ * artifact cannot be mapped back to a request and is skipped.
+ */
+private fun pinnedArtifactNotation(coordinate: ModuleCoordinate, fileName: String): String? {
+    val prefix = "${coordinate.module}-${coordinate.version}"
+    if (!fileName.startsWith(prefix)) {
+        return null
+    }
+
+    val remainder = fileName.removePrefix(prefix)
+    val (classifier, extension) = when {
+        remainder.startsWith(".") -> null to remainder.substring(1)
+        remainder.startsWith("-") -> {
+            val body = remainder.substring(1)
+            val extensionSeparator = body.lastIndexOf('.')
+            if (extensionSeparator <= 0) {
+                return null
+            }
+            body.substring(0, extensionSeparator) to body.substring(extensionSeparator + 1)
+        }
+        else -> return null
+    }
+
+    if (extension.isEmpty()) {
+        return null
+    }
+
+    val classifierSegment = classifier?.let { ":$it" } ?: ""
+    return "${coordinate.group}:${coordinate.module}:${coordinate.version}" +
+        "$classifierSegment@$extension"
+}
+
+private fun resolvePinnedArtifact(
     project: Project,
-    moduleRequests: MutableMap<ModuleRequestScope, ScopedModuleRequests>,
-) {
-    val metadataFile = project.rootProject.projectDir.resolve(ScriptConfig.METADATA_PATH)
-    val requests = parseVerificationMetadataComponents(metadataFile)
-        .associateWith { coordinate ->
-            ModuleRequest(
-                coordinate = coordinate,
-                jvmEnvironments = emptySet(),
-            )
+    owner: ConfigurationOwner,
+    notation: String,
+): Int {
+    val dependency = project.createDependency(owner, notation)
+    val configuration = project.detachedConfiguration(owner, dependency).apply {
+        isTransitive = false
+    }
+
+    return try {
+        val artifacts = configuration.incoming.artifactView {
+            /*
+             * Pinned artifacts are re-resolved only so strict verification
+             * re-checks the existing metadata. Lenient mode tolerates a pinned
+             * artifact a repository no longer publishes, while dependency
+             * verification failures for artifacts that still resolve remain
+             * fail-closed.
+             */
+            lenient(true)
+            componentFilter { componentId ->
+                componentId is ModuleComponentIdentifier
+            }
+        }.artifacts
+
+        artifacts.failures.forEach { failure ->
+            if (failure.isDependencyVerificationFailure()) {
+                throw failure
+            }
         }
 
-    if (requests.isEmpty()) {
+        artifacts.artifacts.size
+    } catch (exception: Exception) {
+        if (exception.isDependencyVerificationFailure()) {
+            throw exception
+        }
+
+        /*
+         * A pinned artifact can require variant attributes that this standalone
+         * probe cannot infer (for example multi-target modules such as Guava that
+         * need a target JVM environment). Those artifacts are already resolved and
+         * verified through the live dependency graph, so re-verification here is
+         * best-effort: tolerate resolution problems, but never a verification
+         * failure.
+         */
+        logger.info(
+            "Skipping pinned verification artifact $notation because the standalone " +
+                "probe could not resolve it.",
+            exception,
+        )
+        0
+    }
+}
+
+/**
+ * Re-resolves exactly the artifacts already recorded in the verification metadata so
+ * strict verification re-checks them, without inferring source, javadoc, or other
+ * classifier requests that the live dependency graph never makes. This keeps the
+ * resolver and the checker symmetric: the resolver records what the graph resolves,
+ * and the checker re-verifies precisely that recorded set rather than expanding
+ * metadata-only components (such as multiplatform relocation targets) into artifacts
+ * that were never pinned.
+ */
+private fun verifyPinnedVerificationMetadataArtifacts(
+    project: Project,
+    stats: ResolveStats,
+) {
+    val metadataFile = project.rootProject.projectDir.resolve(ScriptConfig.METADATA_PATH)
+    val pinnedComponents = parseVerificationMetadataPinnedComponents(metadataFile)
+    if (pinnedComponents.isEmpty()) {
         return
     }
 
-    moduleRequests.merge(
-        project = project.rootProject,
-        owner = ConfigurationOwner.BUILDSCRIPT,
-        requests = requests,
-    )
-    moduleRequests.merge(
-        project = project.rootProject,
-        owner = ConfigurationOwner.PROJECT,
-        requests = requests,
-    )
+    val seen = mutableSetOf<String>()
+    pinnedComponents
+        .sortedWith(
+            compareBy<PinnedComponent> { it.coordinate.group }
+                .thenBy { it.coordinate.module }
+                .thenBy { it.coordinate.version },
+        )
+        .forEach { component ->
+            component.artifactNames.sorted().forEach { artifactName ->
+                val notation = pinnedArtifactNotation(component.coordinate, artifactName)
+                if (notation == null) {
+                    logger.info(
+                        "Skipping pinned verification artifact $artifactName for " +
+                            "${component.coordinate.notation()} because its notation could " +
+                            "not be derived.",
+                    )
+                    return@forEach
+                }
+                if (!seen.add(notation)) {
+                    return@forEach
+                }
+
+                logger.info("Verifying pinned $notation")
+                /*
+                 * The metadata file does not record whether a component came from a
+                 * project or buildscript repository, so re-verify through the project
+                 * scope first and fall back to the buildscript scope only when the
+                 * project repositories cannot serve the artifact.
+                 */
+                val projectArtifactCount = resolvePinnedArtifact(
+                    project = project.rootProject,
+                    owner = ConfigurationOwner.PROJECT,
+                    notation = notation,
+                )
+                stats.pinnedVerificationArtifactCount += if (projectArtifactCount > 0) {
+                    projectArtifactCount
+                } else {
+                    resolvePinnedArtifact(
+                        project = project.rootProject,
+                        owner = ConfigurationOwner.BUILDSCRIPT,
+                        notation = notation,
+                    )
+                }
+            }
+        }
 }
 
 private fun minimalVerificationMetadata(): String {
@@ -2152,7 +2296,6 @@ private fun Project.registerDependencyVerificationResolverTask(
                 owner = ConfigurationOwner.PROJECT,
                 requests = buildSrcRequests,
             )
-            seedExistingVerificationMetadataComponents(rootProject, moduleRequests)
 
             resolveClassifierDocumentationArtifacts(
                 scopedRequests = moduleRequests.values,
@@ -2168,6 +2311,8 @@ private fun Project.registerDependencyVerificationResolverTask(
                 scopedRequests = moduleRequests.values,
                 stats = stats,
             )
+
+            verifyPinnedVerificationMetadataArtifacts(rootProject, stats)
 
             resolveGradleEmbeddedGroovyArtifacts(rootProject, stats)
 
@@ -2189,6 +2334,8 @@ private fun Project.registerDependencyVerificationResolverTask(
                     "${stats.gradleEmbeddedLibraryArtifactCount} " +
                     "Gradle embedded library artifact(s), " +
                     "${stats.hostToolArtifactCount} host tool artifact(s), " +
+                    "${stats.pinnedVerificationArtifactCount} " +
+                    "pinned verification artifact(s), " +
                     "${stats.gradleSourceDistributionCount} Gradle source distribution(s).",
             )
         }
