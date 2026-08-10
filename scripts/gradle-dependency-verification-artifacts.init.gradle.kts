@@ -9,6 +9,7 @@ import javax.inject.Inject
 import javax.xml.XMLConstants
 import javax.xml.parsers.DocumentBuilderFactory
 import javax.xml.parsers.ParserConfigurationException
+import org.gradle.api.Task
 import org.gradle.api.GradleException
 import org.gradle.api.Plugin
 import org.gradle.api.Project
@@ -35,12 +36,14 @@ import org.gradle.api.flow.FlowAction
 import org.gradle.api.flow.FlowParameters
 import org.gradle.api.flow.FlowProviders
 import org.gradle.api.flow.FlowScope
+import org.gradle.api.initialization.IncludedBuild
 import org.gradle.api.initialization.resolve.RepositoriesMode
 import org.gradle.api.invocation.Gradle
 import org.gradle.api.logging.Logging
 import org.gradle.api.provider.Property
 import org.gradle.api.specs.Spec
 import org.gradle.api.tasks.Input
+import org.gradle.api.tasks.TaskProvider
 import org.w3c.dom.Element
 import org.w3c.dom.Node
 import org.xml.sax.InputSource
@@ -50,6 +53,8 @@ private object ScriptConfig {
     const val SCRIPT_FILE_NAME = "gradle-dependency-verification-artifacts.init.gradle.kts"
     const val RESOLVE_TASK_NAME = "resolveDependencyVerificationArtifacts"
     const val CHECK_TASK_NAME = "checkDependencyVerificationHashes"
+    const val PROJECT_ARTIFACTS_TASK_NAME =
+        "resolveProjectDependencyVerificationArtifacts"
     const val CLEAN_METADATA_PROPERTY_NAME = "cleanDependencyVerificationMetadata"
     const val METADATA_PATH = "gradle/verification-metadata.xml"
     const val GRADLE_DISTRIBUTIONS_REPOSITORY_NAME = "GrapheneOS Gradle distributions"
@@ -541,6 +546,48 @@ private class ResolveStats {
     var hostToolArtifactCount: Int = 0
     var gradleSourceDistributionCount: Int = 0
     var pinnedVerificationArtifactCount: Int = 0
+    var nestedBuildLogicBuildCount: Int = 0
+    var nestedBuildLogicComponentCount: Int = 0
+    var settingsPluginMarkerCount: Int = 0
+    var settingsPluginComponentCount: Int = 0
+
+    fun add(other: ResolveStats) {
+        primaryConfigurationCount += other.primaryConfigurationCount
+        externalModuleFallbackConfigurationCount += other.externalModuleFallbackConfigurationCount
+        dependencyMetadataArtifactCount += other.dependencyMetadataArtifactCount
+        sourceClassifierArtifactCount += other.sourceClassifierArtifactCount
+        javadocClassifierArtifactCount += other.javadocClassifierArtifactCount
+        metadataDocumentationArtifactCount += other.metadataDocumentationArtifactCount
+        gradleEmbeddedLibraryArtifactCount += other.gradleEmbeddedLibraryArtifactCount
+        hostToolArtifactCount += other.hostToolArtifactCount
+        gradleSourceDistributionCount += other.gradleSourceDistributionCount
+        pinnedVerificationArtifactCount += other.pinnedVerificationArtifactCount
+        nestedBuildLogicBuildCount += other.nestedBuildLogicBuildCount
+        nestedBuildLogicComponentCount += other.nestedBuildLogicComponentCount
+        settingsPluginMarkerCount += other.settingsPluginMarkerCount
+        settingsPluginComponentCount += other.settingsPluginComponentCount
+    }
+
+    fun snapshot(): ResolveStats {
+        return ResolveStats().also { snapshot -> snapshot.add(this) }
+    }
+}
+
+private object ProjectResolutionState {
+    private val lock = Any()
+    private val stats = ResolveStats()
+
+    fun record(projectStats: ResolveStats) {
+        synchronized(lock) {
+            stats.add(projectStats)
+        }
+    }
+
+    fun statsSnapshot(): ResolveStats {
+        return synchronized(lock) {
+            stats.snapshot()
+        }
+    }
 }
 
 private data class ModuleId(
@@ -560,6 +607,170 @@ private data class ModuleCoordinate(
     fun notation(suffix: String = ""): String {
         return "$group:$module:$version$suffix"
     }
+}
+
+private val settingsPluginMarkerRequests = mutableSetOf<ModuleCoordinate>()
+
+private val pluginIdVersionRegex = Regex(
+    pattern = """\bid\s*(?:\(\s*)?["']([^"']+)["']\s*\)?\s*version\s*(?:\(\s*)?["']([^"']+)["']\s*\)?""",
+)
+
+private fun Char.isGradleIdentifierPart(): Boolean {
+    return isLetterOrDigit() || this == '_' || this == '-' || this == '.'
+}
+
+private fun String.hasGradleKeywordAt(index: Int, keyword: String): Boolean {
+    if (index + keyword.length > length) {
+        return false
+    }
+    if (substring(index, index + keyword.length) != keyword) {
+        return false
+    }
+
+    val before = getOrNull(index - 1)
+    val after = getOrNull(index + keyword.length)
+    return before?.isGradleIdentifierPart() != true &&
+        after?.isGradleIdentifierPart() != true
+}
+
+private fun String.nextNonWhitespaceIndex(startIndex: Int): Int {
+    var index = startIndex
+    while (index < length && this[index].isWhitespace()) {
+        index += 1
+    }
+    return index
+}
+
+private fun String.skipGradleLiteralOrComment(index: Int): Int? {
+    val current = this[index]
+    val next = getOrNull(index + 1)
+    if (current == '/' && next == '/') {
+        val newline = indexOf('\n', startIndex = index + 2)
+        return if (newline == -1) length else newline + 1
+    }
+    if (current == '/' && next == '*') {
+        val commentEnd = indexOf("*/", startIndex = index + 2)
+        return if (commentEnd == -1) length else commentEnd + 2
+    }
+    if (startsWith("\"\"\"", startIndex = index)) {
+        val stringEnd = indexOf("\"\"\"", startIndex = index + 3)
+        return if (stringEnd == -1) length else stringEnd + 3
+    }
+    if (startsWith("'''", startIndex = index)) {
+        val stringEnd = indexOf("'''", startIndex = index + 3)
+        return if (stringEnd == -1) length else stringEnd + 3
+    }
+    if (current != '"' && current != '\'') {
+        return null
+    }
+
+    var cursor = index + 1
+    var escaped = false
+    while (cursor < length) {
+        val character = this[cursor]
+        when {
+            escaped -> escaped = false
+            character == '\\' -> escaped = true
+            character == current -> return cursor + 1
+        }
+        cursor += 1
+    }
+    return length
+}
+
+private fun String.matchingGradleBrace(openBraceIndex: Int): Int? {
+    var depth = 1
+    var index = openBraceIndex + 1
+    while (index < length) {
+        val skipped = skipGradleLiteralOrComment(index)
+        if (skipped != null) {
+            index = skipped
+            continue
+        }
+
+        when (this[index]) {
+            '{' -> depth += 1
+            '}' -> {
+                depth -= 1
+                if (depth == 0) {
+                    return index
+                }
+            }
+        }
+        index += 1
+    }
+    return null
+}
+
+private fun String.topLevelGradleBlockBodies(blockName: String): List<String> {
+    val bodies = mutableListOf<String>()
+    var depth = 0
+    var index = 0
+    while (index < length) {
+        val skipped = skipGradleLiteralOrComment(index)
+        if (skipped != null) {
+            index = skipped
+            continue
+        }
+
+        if (depth == 0 && hasGradleKeywordAt(index, blockName)) {
+            val openBrace = nextNonWhitespaceIndex(index + blockName.length)
+            if (getOrNull(openBrace) == '{') {
+                val closeBrace = matchingGradleBrace(openBrace) ?: return bodies
+                bodies.add(substring(openBrace + 1, closeBrace))
+                index = closeBrace + 1
+                continue
+            }
+        }
+
+        when (this[index]) {
+            '{' -> depth += 1
+            '}' -> if (depth > 0) {
+                depth -= 1
+            }
+        }
+        index += 1
+    }
+    return bodies
+}
+
+private fun settingsPluginMarkerCoordinate(pluginId: String, version: String): ModuleCoordinate {
+    return ModuleCoordinate(
+        group = pluginId,
+        module = "$pluginId.gradle.plugin",
+        version = version,
+    )
+}
+
+private fun parseSettingsPluginMarkerRequests(settingsDirectory: File): Set<ModuleCoordinate> {
+    return listOf("settings.gradle.kts", "settings.gradle")
+        .map { fileName -> settingsDirectory.resolve(fileName) }
+        .filter { settingsFile -> settingsFile.isFile }
+        .flatMap { settingsFile ->
+            settingsFile.readText(Charsets.UTF_8)
+                .topLevelGradleBlockBodies("plugins")
+                .flatMap { pluginsBlock ->
+                    pluginIdVersionRegex.findAll(pluginsBlock)
+                        .map { match ->
+                            settingsPluginMarkerCoordinate(
+                                pluginId = match.groupValues[1],
+                                version = match.groupValues[2],
+                            )
+                        }
+                }
+        }
+        .toSet()
+}
+
+settingsEvaluated {
+    val markerRequests = parseSettingsPluginMarkerRequests(settingsDir)
+    if (markerRequests.isNotEmpty()) {
+        logger.info(
+            "Detected ${markerRequests.size} exact settings plugin marker request(s) in " +
+                settingsDir.absolutePath,
+        )
+    }
+    settingsPluginMarkerRequests.addAll(markerRequests)
 }
 
 private fun String.isExactModuleVersion(): Boolean {
@@ -589,12 +800,18 @@ private fun ModuleComponentSelector.exactModuleCoordinate(): ModuleCoordinate? {
     )
 }
 
+/**
+ * [version] pins the artifact independently of the marker. Leave it null when the tool is
+ * versioned with the plugin that requests it; set it when the plugin hard-codes a version of
+ * its own, which no marker coordinate can supply.
+ */
 private data class HostToolRule(
     val marker: ModuleId,
     val artifact: ModuleId,
     val classifiers: List<String?>,
     val extension: String,
     val transitive: Boolean = false,
+    val version: String? = null,
 )
 
 private data class HostToolRequest(
@@ -609,6 +826,7 @@ private fun HostToolRule.classifierSortKey(): String {
 private data class ModuleRequest(
     val coordinate: ModuleCoordinate,
     val jvmEnvironments: Set<String>,
+    val documentationArtifacts: Set<ModuleMetadataDocumentationArtifact>,
 )
 
 private data class ModuleMetadataDocumentationArtifact(
@@ -652,6 +870,7 @@ private data class ScopedModuleCoordinate(
     val project: Project,
     val owner: ConfigurationOwner,
     val coordinate: ModuleCoordinate,
+    val documentationArtifacts: Set<ModuleMetadataDocumentationArtifact>,
 )
 
 private data class ScopedModuleCoordinateKey(
@@ -682,6 +901,27 @@ private val hostToolRules = listOf(
     HostToolRule(
         marker = ModuleId("com.google.devtools.ksp", "symbol-processing-gradle-plugin"),
         artifact = ModuleId("com.google.devtools.ksp", "symbol-processing-aa-embeddable"),
+        classifiers = listOf(null),
+        extension = "jar",
+        transitive = true,
+    ),
+    /*
+     * KspAATask's detached classpath declares coroutines alongside the embeddable processor
+     * rather than depending on it, at KSPVersions.kt's KSP_COROUTINES_VERSION constant, which
+     * moves independently of the KSP version. Resolving the embeddable artifact therefore never
+     * reaches it. Update this version when a KSP upgrade fails verification on it.
+     */
+    HostToolRule(
+        marker = ModuleId("com.google.devtools.ksp", "symbol-processing-gradle-plugin"),
+        artifact = ModuleId("org.jetbrains.kotlinx", "kotlinx-coroutines-core-jvm"),
+        classifiers = listOf(null),
+        extension = "jar",
+        transitive = true,
+        version = "1.10.2",
+    ),
+    HostToolRule(
+        marker = ModuleId("com.android.tools.lint", "lint-model"),
+        artifact = ModuleId("com.android.tools.lint", "lint-gradle"),
         classifiers = listOf(null),
         extension = "jar",
         transitive = true,
@@ -767,6 +1007,28 @@ private fun Throwable.isStandaloneResolutionTimingFailure(): Boolean {
                     message.contains("has not completed")
             )
     }
+}
+
+private fun Throwable.isProjectVariantAmbiguityFailure(): Boolean {
+    val messages = messageChain()
+    return messages.any { message ->
+        message.contains("Could not resolve project ")
+    } && messages.any { message ->
+        message.contains("There are several available matching variants of project ")
+    }
+}
+
+private fun Throwable.isUnsafeConfigurationResolutionFailure(): Boolean {
+    return messageChain().any { message ->
+        message.contains("Resolution of the configuration ") &&
+            message.contains("was attempted without an exclusive lock")
+    }
+}
+
+private fun Throwable.isStandaloneResolverFallbackFailure(): Boolean {
+    return isStandaloneResolutionTimingFailure() ||
+        isProjectVariantAmbiguityFailure() ||
+        isUnsafeConfigurationResolutionFailure()
 }
 
 private fun <T : Any> copyAttribute(
@@ -1038,7 +1300,37 @@ private fun parseGradleModuleMetadata(
     )
 }
 
-private fun resolvePrimaryArtifacts(configuration: Configuration) {
+private fun androidVariantDocumentationArtifacts(
+    coordinate: ModuleCoordinate,
+    file: File,
+): Set<ModuleMetadataDocumentationArtifact> {
+    if (file.extension != "aar") {
+        return emptySet()
+    }
+
+    val prefix = "${coordinate.module}-${coordinate.version}-"
+    val classifier = file.name
+        .takeIf { name -> name.startsWith(prefix) }
+        ?.removePrefix(prefix)
+        ?.removeSuffix(".aar")
+        ?.takeIf { it.isNotEmpty() && it != file.name }
+        ?: return emptySet()
+
+    return setOf(
+        ModuleMetadataDocumentationArtifact(
+            classifier = "$classifier-sources",
+            docsType = DocsType.SOURCES,
+        ),
+        ModuleMetadataDocumentationArtifact(
+            classifier = "$classifier-javadoc",
+            docsType = DocsType.JAVADOC,
+        ),
+    )
+}
+
+private fun resolvePrimaryArtifacts(
+    configuration: Configuration,
+): Map<ModuleCoordinate, Set<ModuleMetadataDocumentationArtifact>> {
     /*
      * Resolve external module artifacts only. Project outputs are not stored in
      * dependency verification metadata, and Android app projects expose internal
@@ -1052,6 +1344,26 @@ private fun resolvePrimaryArtifacts(configuration: Configuration) {
     }.artifacts
 
     artifacts.artifactFiles.forceResolveFiles()
+    return artifacts.artifacts
+        .mapNotNull { artifact ->
+            val module = artifact.id.componentIdentifier as? ModuleComponentIdentifier
+                ?: return@mapNotNull null
+            val coordinate = ModuleCoordinate(
+                group = module.group,
+                module = module.module,
+                version = module.version,
+            )
+            coordinate to androidVariantDocumentationArtifacts(
+                coordinate = coordinate,
+                file = artifact.file,
+            )
+        }
+        .filter { (_, documentationArtifacts) -> documentationArtifacts.isNotEmpty() }
+        .groupBy(
+            keySelector = { (coordinate, _) -> coordinate },
+            valueTransform = { (_, documentationArtifacts) -> documentationArtifacts },
+        )
+        .mapValues { (_, artifactsByVariant) -> artifactsByVariant.flatten().toSet() }
 }
 
 private fun resolvedModuleRequests(
@@ -1107,17 +1419,20 @@ private fun classifierJvmEnvironments(module: ModuleRequest): Set<String> {
 private fun MutableMap<ModuleCoordinate, ModuleRequest>.mergeModuleRequest(
     coordinate: ModuleCoordinate,
     jvmEnvironments: Set<String>,
+    documentationArtifacts: Set<ModuleMetadataDocumentationArtifact> = emptySet(),
 ) {
     merge(
         coordinate,
         ModuleRequest(
             coordinate = coordinate,
             jvmEnvironments = jvmEnvironments,
+            documentationArtifacts = documentationArtifacts,
         ),
     ) { existing, new ->
         ModuleRequest(
             coordinate = existing.coordinate,
             jvmEnvironments = existing.jvmEnvironments + new.jvmEnvironments,
+            documentationArtifacts = existing.documentationArtifacts + new.documentationArtifacts,
         )
     }
 }
@@ -1126,7 +1441,11 @@ private fun MutableMap<ModuleCoordinate, ModuleRequest>.merge(
     requests: Map<ModuleCoordinate, ModuleRequest>,
 ) {
     requests.forEach { (coordinate, request) ->
-        mergeModuleRequest(coordinate, request.jvmEnvironments)
+        mergeModuleRequest(
+            coordinate = coordinate,
+            jvmEnvironments = request.jvmEnvironments,
+            documentationArtifacts = request.documentationArtifacts,
+        )
     }
 }
 
@@ -1235,6 +1554,33 @@ private fun detachedClassifierConfiguration(
                     project.objects.named(TargetJvmEnvironment::class.java, jvmEnvironment),
                 )
             }
+        }
+    }
+}
+
+private fun detachedDocumentationClassifierConfiguration(
+    project: Project,
+    owner: ConfigurationOwner,
+    module: ModuleCoordinate,
+    classifier: String,
+    docsType: String,
+): Configuration {
+    val dependency = project.createDependency(
+        owner = owner,
+        notation = "${module.group}:${module.module}:${module.version}:$classifier@jar",
+    )
+    return project.detachedConfiguration(owner, dependency).apply {
+        isTransitive = false
+        configureExternalRuntimeAttributes(project)
+        attributes {
+            attribute(
+                Category.CATEGORY_ATTRIBUTE,
+                project.objects.named(Category::class.java, Category.DOCUMENTATION),
+            )
+            attribute(
+                DocsType.DOCS_TYPE_ATTRIBUTE,
+                project.objects.named(DocsType::class.java, docsType),
+            )
         }
     }
 }
@@ -1365,6 +1711,36 @@ private fun resolveClassifierDocumentationArtifactCount(
     return files.size
 }
 
+private fun resolveDocumentationClassifierArtifactFiles(
+    project: Project,
+    owner: ConfigurationOwner,
+    module: ModuleCoordinate,
+    artifact: ModuleMetadataDocumentationArtifact,
+): Set<File> {
+    val configuration = detachedDocumentationClassifierConfiguration(
+        project = project,
+        owner = owner,
+        module = module,
+        classifier = artifact.classifier,
+        docsType = artifact.docsType,
+    )
+
+    val artifacts = configuration.incoming.artifactView {
+        /*
+         * Gradle module metadata can declare Android variant documentation
+         * classifiers such as debug-javadoc. Those resolve through
+         * documentation attributes, not the generic library/JAR classifier
+         * profile used for Maven-style sources and javadocs.
+         */
+        lenient(true)
+        componentFilter { componentId ->
+            componentId is ModuleComponentIdentifier
+        }
+    }.artifacts
+
+    return artifacts.artifactFiles.resolvedFiles()
+}
+
 private fun resolveMetadataDocumentationArtifactCount(
     project: Project,
     owner: ConfigurationOwner,
@@ -1375,16 +1751,12 @@ private fun resolveMetadataDocumentationArtifactCount(
         "Resolving ${project.path}:${owner.label} metadata documentation artifact " +
             module.notation(":${artifact.classifier}@jar"),
     )
-    val request = ModuleRequest(
-        coordinate = module,
-        jvmEnvironments = emptySet(),
-    )
-    return resolveClassifierDocumentationArtifactCount(
+    return resolveDocumentationClassifierArtifactFiles(
         project = project,
         owner = owner,
-        request = request,
-        classifier = artifact.classifier,
-    )
+        module = module,
+        artifact = artifact,
+    ).size
 }
 
 private fun resolveOptionalMetadataDocumentationArtifactCount(
@@ -1460,13 +1832,16 @@ private fun resolveOptionalModuleArtifactFiles(
         null,
     ).forEach { category ->
         try {
-            return resolveOptionalModuleArtifactFiles(
+            val files = resolveOptionalModuleArtifactFiles(
                 project = project,
                 owner = owner,
                 module = module,
                 extension = extension,
                 category = category,
             )
+            if (files.isNotEmpty()) {
+                return files
+            }
         } catch (exception: Exception) {
             if (exception.isDependencyVerificationFailure()) {
                 throw exception
@@ -1545,16 +1920,17 @@ private fun resolveDependencyMetadataArtifacts(
         compareBy<ScopedModuleRequests> { it.project.path }
             .thenBy { it.owner.label },
     ).forEach { scopedRequest ->
-        scopedRequest.requests.keys.sortedWith(
-            compareBy<ModuleCoordinate> { it.group }
-                .thenBy { it.module }
-                .thenBy { it.version },
-        ).forEach { coordinate ->
+        scopedRequest.requests.values.sortedWith(
+            compareBy<ModuleRequest> { it.coordinate.group }
+                .thenBy { it.coordinate.module }
+                .thenBy { it.coordinate.version },
+        ).forEach { moduleRequest ->
             pending.add(
                 ScopedModuleCoordinate(
                     project = scopedRequest.project,
                     owner = scopedRequest.owner,
-                    coordinate = coordinate,
+                    coordinate = moduleRequest.coordinate,
+                    documentationArtifacts = moduleRequest.documentationArtifacts,
                 ),
             )
         }
@@ -1616,6 +1992,21 @@ private fun resolveDependencyMetadataArtifacts(
                 stats = stats,
             )
         }
+        request.documentationArtifacts
+            .sortedWith(
+                compareBy<ModuleMetadataDocumentationArtifact> { it.docsType }
+                    .thenBy { it.classifier },
+            )
+            .forEach { artifact ->
+                resolveMetadataDocumentationArtifactOnce(
+                    project = request.project,
+                    owner = request.owner,
+                    module = request.coordinate,
+                    artifact = artifact,
+                    resolvedDocumentationArtifacts = resolvedDocumentationArtifacts,
+                    stats = stats,
+                )
+            }
 
         val parsedModuleMetadata = moduleMetadataFiles.map { moduleMetadataFile ->
             parseGradleModuleMetadata(
@@ -1660,6 +2051,7 @@ private fun resolveDependencyMetadataArtifacts(
                         project = request.project,
                         owner = request.owner,
                         coordinate = discoveredCoordinate,
+                        documentationArtifacts = emptySet(),
                     ),
                 )
             }
@@ -1714,6 +2106,7 @@ private fun resolveGradleEmbeddedGroovyModule(
     val request = ModuleRequest(
         coordinate = module,
         jvmEnvironments = emptySet(),
+        documentationArtifacts = emptySet(),
     )
     val sourceArtifactCount = resolveClassifierDocumentationArtifactCount(
         project = project,
@@ -1835,6 +2228,18 @@ private fun resolveHostToolArtifact(
     )
     val configuration = project.detachedConfiguration(owner, dependency).apply {
         isTransitive = transitive
+        if (transitive) {
+            configureExternalRuntimeJarAttributes(project)
+            attributes {
+                attribute(
+                    TargetJvmEnvironment.TARGET_JVM_ENVIRONMENT_ATTRIBUTE,
+                    project.objects.named(
+                        TargetJvmEnvironment::class.java,
+                        TargetJvmEnvironment.STANDARD_JVM,
+                    ),
+                )
+            }
+        }
     }
 
     val artifacts = configuration.incoming.artifactView {
@@ -1867,7 +2272,7 @@ private fun hostToolRequests(
                         coordinate = ModuleCoordinate(
                             group = rule.artifact.group,
                             module = rule.artifact.module,
-                            version = markerCoordinate.version,
+                            version = rule.version ?: markerCoordinate.version,
                         ),
                     )
                 }
@@ -1915,12 +2320,93 @@ private fun resolveHostToolArtifacts(
     }
 }
 
+private fun resolveSettingsPluginMarkerArtifacts(
+    project: Project,
+    marker: ModuleCoordinate,
+): ResolvedDetachedArtifacts {
+    val dependency = project.createDependency(
+        owner = ConfigurationOwner.BUILDSCRIPT,
+        notation = marker.notation(),
+    )
+    val configuration = project.detachedConfiguration(
+        owner = ConfigurationOwner.BUILDSCRIPT,
+        dependency = dependency,
+    ).apply {
+        isTransitive = true
+    }
+
+    val artifacts = configuration.incoming.artifactView {
+        componentFilter { componentId ->
+            componentId is ModuleComponentIdentifier
+        }
+    }.artifacts
+
+    return ResolvedDetachedArtifacts(
+        files = artifacts.artifactFiles.resolvedFiles(),
+        moduleRequests = resolvedModuleRequests(configuration),
+    )
+}
+
+private fun resolveSettingsPluginMarkerRequests(
+    project: Project,
+    stats: ResolveStats,
+): Map<ModuleCoordinate, ModuleRequest> {
+    if (settingsPluginMarkerRequests.isEmpty()) {
+        return emptyMap()
+    }
+
+    logger.lifecycle(
+        "Resolving ${settingsPluginMarkerRequests.size} settings plugin marker(s) " +
+            "for dependency verification metadata.",
+    )
+    stats.settingsPluginMarkerCount += settingsPluginMarkerRequests.size
+
+    val requests = mutableMapOf<ModuleCoordinate, ModuleRequest>()
+    settingsPluginMarkerRequests
+        .sortedWith(
+            compareBy<ModuleCoordinate> { it.group }
+                .thenBy { it.module }
+                .thenBy { it.version },
+        )
+        .forEach { marker ->
+            requests.mergeModuleRequest(marker, emptySet())
+            logger.info("Resolving settings plugin marker ${marker.notation()}")
+            try {
+                val resolvedArtifacts = resolveSettingsPluginMarkerArtifacts(
+                    project = project,
+                    marker = marker,
+                )
+                stats.settingsPluginComponentCount += resolvedArtifacts.moduleRequests.size
+                requests.merge(resolvedArtifacts.moduleRequests)
+            } catch (exception: Exception) {
+                if (exception.isDependencyVerificationFailure()) {
+                    throw exception
+                }
+                logger.info(
+                    "Skipping transitive settings plugin marker probe for " +
+                        marker.notation() +
+                        " because it could not be resolved through the buildscript scope.",
+                    exception,
+                )
+            }
+        }
+
+    return requests
+}
+
 private fun resolveStandaloneConfigurationArtifacts(
     project: Project,
     configuration: Configuration,
 ): Map<ModuleCoordinate, ModuleRequest> {
-    resolvePrimaryArtifacts(configuration)
-    val requests = resolvedModuleRequests(configuration)
+    val primaryDocumentationArtifacts = resolvePrimaryArtifacts(configuration)
+    val requests = resolvedModuleRequests(configuration).toMutableMap()
+    primaryDocumentationArtifacts.forEach { (coordinate, documentationArtifacts) ->
+        requests.mergeModuleRequest(
+            coordinate = coordinate,
+            jvmEnvironments = emptySet(),
+            documentationArtifacts = documentationArtifacts,
+        )
+    }
 
     resolveDocumentationArtifactsForCommonPlatforms(project, configuration, DocsType.SOURCES)
     resolveDocumentationArtifactsForCommonPlatforms(project, configuration, DocsType.JAVADOC)
@@ -1941,7 +2427,7 @@ private fun resolveConfigurationArtifacts(
     } catch (exception: Exception) {
         if (
             exception.isDependencyVerificationFailure() ||
-            !exception.isStandaloneResolutionTimingFailure()
+            !exception.isStandaloneResolverFallbackFailure()
         ) {
             throw exception
         }
@@ -1949,8 +2435,8 @@ private fun resolveConfigurationArtifacts(
         logger.lifecycle(
             "Resolving ${configuration.displayName(project, owner)} through an " +
                 "external-module-only copy because the original configuration " +
-                "depends on task outputs " +
-                "that are not available to this standalone resolver.",
+                "depends on task outputs, project variants, or Gradle project " +
+                "lock rules that are not available to this standalone resolver.",
         )
 
         val fallbackConfiguration = externalModuleConfigurationCopy(configuration)
@@ -2020,6 +2506,24 @@ private fun resolveProjectConfigurations(
         owner = ConfigurationOwner.PROJECT,
         configurations = project.configurations,
         moduleRequests = moduleRequests,
+        stats = stats,
+    )
+}
+
+private fun resolveProjectDependencyVerificationArtifacts(project: Project, stats: ResolveStats) {
+    val moduleRequests = mutableMapOf<ModuleRequestScope, ScopedModuleRequests>()
+
+    resolveProjectConfigurations(project, moduleRequests, stats)
+    resolveClassifierDocumentationArtifacts(
+        scopedRequests = moduleRequests.values,
+        stats = stats,
+    )
+    resolveHostToolArtifacts(
+        scopedRequests = moduleRequests.values,
+        stats = stats,
+    )
+    resolveDependencyMetadataArtifacts(
+        scopedRequests = moduleRequests.values,
         stats = stats,
     )
 }
@@ -2198,24 +2702,26 @@ private fun currentInitScriptFile(): File {
     )
 }
 
-private fun Project.resolveBuildSrcVerificationMetadataComponents(): Set<ModuleCoordinate> {
-    if (!writeVerificationMetadataRequested || rootProject.projectDir.name == "buildSrc") {
-        return emptySet()
-    }
-
-    val buildSrcDir = rootProject.projectDir.resolve("buildSrc")
-    if (!buildSrcDir.isDirectory) {
-        return emptySet()
-    }
-
-    val wrapper = rootProject.projectDir.resolve(
+private fun Project.gradleWrapper(): File? {
+    return rootProject.projectDir.resolve(
         if (System.getProperty("os.name").startsWith("Windows")) "gradlew.bat" else "gradlew",
-    )
-    if (!wrapper.isFile) {
+    ).takeIf { wrapper -> wrapper.isFile }
+}
+
+private fun Project.resolveNestedBuildVerificationMetadataComponents(
+    buildDirectory: File,
+    displayName: String,
+    stats: ResolveStats,
+): Set<ModuleCoordinate> {
+    if (!writeVerificationMetadataRequested) {
+        return emptySet()
+    }
+    if (rootProject.projectDir.canonicalFile == buildDirectory.canonicalFile) {
         return emptySet()
     }
 
-    val metadataFile = buildSrcDir.resolve(ScriptConfig.METADATA_PATH)
+    val wrapper = gradleWrapper() ?: return emptySet()
+    val metadataFile = buildDirectory.resolve(ScriptConfig.METADATA_PATH)
     val metadataDirectory = metadataFile.parentFile
     val metadataDirectoryExisted = metadataDirectory.isDirectory
     val originalMetadata = metadataFile.takeIf { it.isFile }?.readText(Charsets.UTF_8)
@@ -2225,6 +2731,9 @@ private fun Project.resolveBuildSrcVerificationMetadataComponents(): Set<ModuleC
     try {
         val writeVerificationMetadata =
             gradle.startParameter.writeDependencyVerifications.joinToString(",")
+        logger.lifecycle(
+            "Resolving $displayName dependency verification artifacts for root metadata.",
+        )
         val process = ProcessBuilder(
             wrapper.absolutePath,
             "--no-daemon",
@@ -2235,18 +2744,21 @@ private fun Project.resolveBuildSrcVerificationMetadataComponents(): Set<ModuleC
             writeVerificationMetadata,
             ScriptConfig.RESOLVE_TASK_NAME,
         )
-            .directory(buildSrcDir)
+            .directory(buildDirectory)
             .redirectErrorStream(true)
             .start()
         val output = process.inputStream.bufferedReader().readText()
         val exitCode = process.waitFor()
         if (exitCode != 0) {
             throw GradleException(
-                "Could not resolve buildSrc dependency verification artifacts.\n$output",
+                "Could not resolve $displayName dependency verification artifacts.\n$output",
             )
         }
 
-        return parseVerificationMetadataComponents(metadataFile)
+        val components = parseVerificationMetadataComponents(metadataFile)
+        stats.nestedBuildLogicBuildCount += 1
+        stats.nestedBuildLogicComponentCount += components.size
+        return components
     } finally {
         if (originalMetadata != null) {
             metadataFile.writeText(originalMetadata, Charsets.UTF_8)
@@ -2259,66 +2771,133 @@ private fun Project.resolveBuildSrcVerificationMetadataComponents(): Set<ModuleC
     }
 }
 
-private fun Project.registerDependencyVerificationResolverTask(
-    taskName: String,
-    taskDescription: String,
-) {
-    tasks.register(taskName) {
+private fun Project.resolveBuildSrcVerificationMetadataComponents(
+    stats: ResolveStats,
+): Set<ModuleCoordinate> {
+    val buildSrcDir = rootProject.projectDir.resolve("buildSrc")
+    if (!buildSrcDir.isDirectory) {
+        return emptySet()
+    }
+
+    return resolveNestedBuildVerificationMetadataComponents(
+        buildDirectory = buildSrcDir,
+        displayName = "buildSrc",
+        stats = stats,
+    )
+}
+
+private fun Project.resolveIncludedBuildVerificationMetadataComponents(
+    stats: ResolveStats,
+): Set<ModuleCoordinate> {
+    return gradle.includedBuilds
+        .sortedBy { includedBuild -> includedBuild.name }
+        .flatMap { includedBuild ->
+            resolveIncludedBuildVerificationMetadataComponents(
+                includedBuild = includedBuild,
+                stats = stats,
+            )
+        }
+        .toSet()
+}
+
+private fun Project.resolveIncludedBuildVerificationMetadataComponents(
+    includedBuild: IncludedBuild,
+    stats: ResolveStats,
+): Set<ModuleCoordinate> {
+    return resolveNestedBuildVerificationMetadataComponents(
+        buildDirectory = includedBuild.projectDir,
+        displayName = "included build '${includedBuild.name}'",
+        stats = stats,
+    )
+}
+
+private fun Project.resolveRootDependencyVerificationArtifacts(stats: ResolveStats) {
+    val moduleRequests =
+        mutableMapOf<ModuleRequestScope, ScopedModuleRequests>()
+
+    moduleRequests.merge(
+        project = rootProject,
+        owner = ConfigurationOwner.BUILDSCRIPT,
+        requests = resolveSettingsPluginMarkerRequests(rootProject, stats),
+    )
+    val nestedBuildLogicRequests = (
+        resolveBuildSrcVerificationMetadataComponents(stats) +
+            resolveIncludedBuildVerificationMetadataComponents(stats)
+        )
+        .associateWith { coordinate ->
+            ModuleRequest(
+                coordinate = coordinate,
+                jvmEnvironments = emptySet(),
+                documentationArtifacts = emptySet(),
+            )
+        }
+    moduleRequests.merge(
+        project = rootProject,
+        owner = ConfigurationOwner.BUILDSCRIPT,
+        requests = nestedBuildLogicRequests,
+    )
+    moduleRequests.merge(
+        project = rootProject,
+        owner = ConfigurationOwner.PROJECT,
+        requests = nestedBuildLogicRequests,
+    )
+
+    resolveClassifierDocumentationArtifacts(
+        scopedRequests = moduleRequests.values,
+        stats = stats,
+    )
+    resolveHostToolArtifacts(
+        scopedRequests = moduleRequests.values,
+        stats = stats,
+    )
+    resolveDependencyMetadataArtifacts(
+        scopedRequests = moduleRequests.values,
+        stats = stats,
+    )
+
+    verifyPinnedVerificationMetadataArtifacts(rootProject, stats)
+
+    resolveGradleEmbeddedGroovyArtifacts(rootProject, stats)
+
+    logger.info("Resolving Gradle ${rootProject.gradle.gradleVersion} source distribution")
+    resolveGradleSourceDistribution(rootProject)
+    stats.gradleSourceDistributionCount += 1
+}
+
+private fun Project.registerDependencyVerificationProjectArtifactsTask(): TaskProvider<Task> {
+    return tasks.register(ScriptConfig.PROJECT_ARTIFACTS_TASK_NAME) {
         group = "verification"
-        description = taskDescription
+        description = "Resolves this project's dependency verification artifacts."
         notCompatibleWithConfigurationCache(
             "Dependency verification artifact resolution intentionally inspects " +
-                "configurations across projects.",
+                "project configurations.",
         )
 
         doLast {
             val stats = ResolveStats()
-            val moduleRequests =
-                mutableMapOf<ModuleRequestScope, ScopedModuleRequests>()
+            resolveProjectDependencyVerificationArtifacts(project, stats)
+            ProjectResolutionState.record(stats)
+        }
+    }
+}
 
-            rootProject.allprojects.sortedBy { it.path }.forEach { project ->
-                resolveProjectConfigurations(project, moduleRequests, stats)
-            }
-            val buildSrcRequests = resolveBuildSrcVerificationMetadataComponents()
-                .associateWith { coordinate ->
-                    ModuleRequest(
-                        coordinate = coordinate,
-                        jvmEnvironments = emptySet(),
-                    )
-                }
-            moduleRequests.merge(
-                project = rootProject,
-                owner = ConfigurationOwner.BUILDSCRIPT,
-                requests = buildSrcRequests,
-            )
-            moduleRequests.merge(
-                project = rootProject,
-                owner = ConfigurationOwner.PROJECT,
-                requests = buildSrcRequests,
-            )
+private fun Project.registerDependencyVerificationResolverTask(
+    taskName: String,
+    taskDescription: String,
+    projectArtifactTasks: List<TaskProvider<Task>>,
+) {
+    tasks.register(taskName) {
+        group = "verification"
+        description = taskDescription
+        dependsOn(projectArtifactTasks)
+        notCompatibleWithConfigurationCache(
+            "Dependency verification artifact resolution intentionally inspects " +
+                "project configurations and root-scoped dependency metadata.",
+        )
 
-            resolveClassifierDocumentationArtifacts(
-                scopedRequests = moduleRequests.values,
-                stats = stats,
-            )
-
-            resolveHostToolArtifacts(
-                scopedRequests = moduleRequests.values,
-                stats = stats,
-            )
-
-            resolveDependencyMetadataArtifacts(
-                scopedRequests = moduleRequests.values,
-                stats = stats,
-            )
-
-            verifyPinnedVerificationMetadataArtifacts(rootProject, stats)
-
-            resolveGradleEmbeddedGroovyArtifacts(rootProject, stats)
-
-            logger.info("Resolving Gradle ${rootProject.gradle.gradleVersion} source distribution")
-            resolveGradleSourceDistribution(rootProject)
-            stats.gradleSourceDistributionCount += 1
+        doLast {
+            val stats = ProjectResolutionState.statsSnapshot()
+            resolveRootDependencyVerificationArtifacts(stats)
 
             logger.lifecycle(
                 "Resolved dependency verification artifacts: " +
@@ -2336,6 +2915,10 @@ private fun Project.registerDependencyVerificationResolverTask(
                     "${stats.hostToolArtifactCount} host tool artifact(s), " +
                     "${stats.pinnedVerificationArtifactCount} " +
                     "pinned verification artifact(s), " +
+                    "${stats.nestedBuildLogicComponentCount} component(s) from " +
+                    "${stats.nestedBuildLogicBuildCount} nested build-logic build(s), " +
+                    "${stats.settingsPluginComponentCount} component(s) from " +
+                    "${stats.settingsPluginMarkerCount} settings plugin marker(s), " +
                     "${stats.gradleSourceDistributionCount} Gradle source distribution(s).",
             )
         }
@@ -2343,15 +2926,26 @@ private fun Project.registerDependencyVerificationResolverTask(
 }
 
 gradle.projectsEvaluated {
+    val projectArtifactTasks = rootProject.allprojects
+        .sortedBy { project -> project.path }
+        .map { project -> project.registerDependencyVerificationProjectArtifactsTask() }
+    projectArtifactTasks.zipWithNext().forEach { (previousTask, currentTask) ->
+        currentTask.configure {
+            mustRunAfter(previousTask)
+        }
+    }
+
     rootProject.registerDependencyVerificationResolverTask(
         ScriptConfig.RESOLVE_TASK_NAME,
         "Resolves build, source, javadoc, classifier, host tool, and Gradle source artifacts " +
             "for dependency verification.",
+        projectArtifactTasks,
     )
     rootProject.registerDependencyVerificationResolverTask(
         ScriptConfig.CHECK_TASK_NAME,
         "Checks dependency verification metadata for build, source, javadoc, " +
             "classifier, host tool, " +
             "and Gradle source artifacts.",
+        projectArtifactTasks,
     )
 }

@@ -19,13 +19,19 @@ It makes Gradle proactively resolve every artifact class that has to be verified
 - plain Maven `sources` and `javadoc` classifier artifacts requested by IDE detached
   configurations
 - documentation artifacts declared by Gradle module metadata, including Gradle plugin API
-  variant classifiers such as `gradle813-sources`
-- `buildSrc` build-logic artifacts, including sources requested by Android Studio for
-  `:buildSrc:compileClasspath`
+  variant classifiers such as `gradle813-sources` and Android variant classifiers such as
+  `debug-javadoc`
+- Android build-type documentation classifiers inferred from primary classified AAR artifacts,
+  such as `debug-sources` and `debug-javadoc`
+- exact settings plugin marker declarations, including implementation sources requested by IDE
+  detached configurations for settings plugins
+- nested build-logic artifacts from `buildSrc` and Gradle included builds, including sources
+  requested by Android Studio for build-logic compile classpaths
 - Gradle embedded Groovy module metadata and sources requested from Gradle's internal
   libraries repository during IDE sync
 - known host build-tool artifacts requested by detached configurations, such as platform-specific
-  `aapt2` jars and KSP embeddable processing artifacts
+  `aapt2` jars, KSP embeddable processing artifacts and the coroutines runtime KSP pins for them,
+  and AGP lint tool classpaths
 - the Gradle source distribution zip for the currently running Gradle version
 
 This avoids adding source, javadoc, host-tool, and dependency-metadata hashes only after
@@ -75,9 +81,9 @@ The update command:
 2. rewrites `<components>` to an empty block
 3. uses Gradle's built-in `--write-verification-metadata sha512` mode
 4. resolves normal artifacts, dependency metadata, Gradle documentation variants, Gradle
-   module metadata documentation artifacts, buildSrc build-logic artifacts, plain
-   source/javadoc classifiers, Gradle embedded Groovy artifacts, known detached host-tool
-   artifacts, and the Gradle source distribution
+   module metadata documentation artifacts, settings plugin markers, nested build-logic
+   artifacts, plain source/javadoc classifiers, Gradle embedded Groovy artifacts, known
+   detached host-tool artifacts, and the Gradle source distribution
 
 The init script recognizes Gradle's normal prefix and camel-case task abbreviations for its own
 resolver and check tasks, so abbreviated invocations still apply the pre-settings clean rewrite,
@@ -89,7 +95,8 @@ and reviews are unambiguous.
 Host-tool artifacts are intentionally explicit rules in the init script.
 Add a new rule only for developer-host build tools, not target/client platform libraries.
 This keeps a Linux metadata update complete for macOS and Windows developers without pinning
-unrelated multiplatform target artifacts.
+unrelated multiplatform target artifacts. AGP lint is included here because tasks such as
+annotation extraction create detached lint tool classpaths during task configuration.
 
 The clean rewrite removes stale entries left behind by dependency upgrades. It only runs for
 `resolveDependencyVerificationArtifacts` when Gradle's native `--write-verification-metadata`
@@ -107,25 +114,45 @@ that are later rejected by conflict resolution. The script also parses resolved 
 module metadata, recursively resolving parent POMs, imported BOM POMs, dependencies declared in
 Gradle module metadata, and documentation artifacts declared by Gradle module metadata, because
 those metadata-only files and metadata-selected documentation variants can be verified by Gradle
-without appearing as normal dependency artifacts.
+without appearing as normal dependency artifacts. Metadata-declared documentation classifiers are
+resolved with documentation attributes so Android build-type classifiers such as `debug-javadoc`
+are included.
+
+For classified Android AAR artifacts, the script also probes the matching build-type
+documentation classifiers. For example, resolving `example-1.0-debug.aar` triggers optional
+documentation probes for `example-1.0-debug-sources.jar` and
+`example-1.0-debug-javadoc.jar`.
 
 Some Android plugin configurations are marked resolvable but are only valid inside their owning
-task's execution order. When one of those configurations fails because task outputs are not
-available to this standalone resolver, the script resolves an external-module-only copy of that
-configuration and reports the fallback in the final summary. Dependency verification failures are
-never converted to fallback resolution. The update command cannot be combined with `--dry-run`:
-cleaning metadata is only safe when the resolver task actually executes and Gradle can regenerate
-the component hashes.
+task's execution order or a variant-specific consumer path. When one of those configurations fails
+because task outputs are not available, or because a project dependency has multiple matching
+variants that a generic standalone resolution cannot choose between, the script resolves an
+external-module-only copy of that configuration and reports the fallback in the final summary.
+Dependency verification failures are never converted to fallback resolution. The update command
+cannot be combined with `--dry-run`: cleaning metadata is only safe when the resolver task actually
+executes and Gradle can regenerate the component hashes.
 
-When a repository has `buildSrc`, the update command runs a contained nested `buildSrc`
-verification-metadata pass and then resolves documentation artifacts for those build-logic
-components into the root metadata. The temporary `buildSrc/gradle/verification-metadata.xml` file
-is deleted or restored after the nested pass.
+The public resolver and check tasks are root aggregate tasks. They depend on an internal
+`resolveProjectDependencyVerificationArtifacts` task in every project, so each project's
+buildscript and project configurations are resolved while Gradle holds the owning project's
+execution lock. The root aggregate task then resolves only root-scoped synthetic artifacts such as
+settings plugin markers, nested build-logic components, pinned metadata artifacts, Gradle embedded
+Groovy artifacts, and the Gradle source distribution.
 
-The resolver and check tasks intentionally inspect configurations across projects at execution
-time, so the init script rejects invocations where Gradle's configuration cache is requested. Keep
-`--no-configuration-cache` in automated commands so the invocation is explicit even for
-repositories that enable configuration cache by default.
+When a repository has `buildSrc` or Gradle included builds, the update command runs contained
+nested verification-metadata passes for those build-logic builds and then resolves documentation
+artifacts for those components into the root metadata. Temporary nested
+`gradle/verification-metadata.xml` files are deleted or restored after each nested pass.
+
+Settings plugins are applied before project configurations exist, so the script also parses exact
+top-level `settings.gradle(.kts)` declarations such as `id("...") version "..."`, resolves their
+plugin markers through the buildscript repository scope, and then resolves documentation artifacts
+for the selected marker classpath modules.
+
+The resolver and check tasks intentionally inspect configurations at execution time, so the init
+script rejects invocations where Gradle's configuration cache is requested. Keep
+`--no-configuration-cache` in automated commands so the invocation is explicit even for repositories
+that enable configuration cache by default.
 
 Use a temporary empty `GRADLE_USER_HOME` when you need the result to be independent of the
 developer's existing Gradle cache:
