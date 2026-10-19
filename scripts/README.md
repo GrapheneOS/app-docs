@@ -29,6 +29,8 @@ It makes Gradle proactively resolve every artifact class that has to be verified
   requested by Android Studio for build-logic compile classpaths
 - Gradle embedded Groovy module metadata and sources requested from Gradle's internal
   libraries repository during IDE sync
+- Gradle embedded Kotlin `kotlin-stdlib` and `kotlin-reflect` module metadata and sources
+  requested for Kotlin DSL scripts during IDE sync
 - known host build-tool artifacts requested by detached configurations, such as platform-specific
   `aapt2` jars, KSP embeddable processing artifacts and the coroutines runtime KSP pins for them,
   and AGP lint tool classpaths
@@ -82,8 +84,8 @@ The update command:
 3. uses Gradle's built-in `--write-verification-metadata sha512` mode
 4. resolves normal artifacts, dependency metadata, Gradle documentation variants, Gradle
    module metadata documentation artifacts, settings plugin markers, nested build-logic
-   artifacts, plain source/javadoc classifiers, Gradle embedded Groovy artifacts, known
-   detached host-tool artifacts, and the Gradle source distribution
+   artifacts, plain source/javadoc classifiers, Gradle embedded Groovy and Kotlin artifacts,
+   known detached host-tool artifacts, and the Gradle source distribution
 
 The init script recognizes Gradle's normal prefix and camel-case task abbreviations for its own
 resolver and check tasks, so abbreviated invocations still apply the pre-settings clean rewrite,
@@ -137,7 +139,7 @@ The public resolver and check tasks are root aggregate tasks. They depend on an 
 buildscript and project configurations are resolved while Gradle holds the owning project's
 execution lock. The root aggregate task then resolves only root-scoped synthetic artifacts such as
 settings plugin markers, nested build-logic components, pinned metadata artifacts, Gradle embedded
-Groovy artifacts, and the Gradle source distribution.
+Groovy and Kotlin artifacts, and the Gradle source distribution.
 
 When a repository has `buildSrc` or Gradle included builds, the update command runs contained
 nested verification-metadata passes for those build-logic builds and then resolves documentation
