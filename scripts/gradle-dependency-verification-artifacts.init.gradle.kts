@@ -2086,7 +2086,7 @@ private fun resolveGradleSourceDistribution(project: Project) {
     }
 }
 
-private fun resolveGradleEmbeddedGroovyModule(
+private fun resolveGradleEmbeddedLibraryModule(
     project: Project,
     stats: ResolveStats,
     module: ModuleCoordinate,
@@ -2160,7 +2160,28 @@ private fun gradleEmbeddedGroovyModules(): List<ModuleCoordinate> {
 private fun resolveGradleEmbeddedGroovyArtifacts(project: Project, stats: ResolveStats) {
     gradleEmbeddedGroovyModules().forEach { module ->
         logger.info("Resolving Gradle embedded Groovy artifacts for ${module.notation()}")
-        resolveGradleEmbeddedGroovyModule(
+        resolveGradleEmbeddedLibraryModule(
+            project = project,
+            stats = stats,
+            module = module,
+        )
+    }
+}
+
+private fun gradleEmbeddedKotlinModules(): List<ModuleCoordinate> {
+    return listOf("kotlin-reflect", "kotlin-stdlib").map { module ->
+        ModuleCoordinate(
+            group = "org.jetbrains.kotlin",
+            module = module,
+            version = embeddedKotlinVersion,
+        )
+    }
+}
+
+private fun resolveGradleEmbeddedKotlinArtifacts(project: Project, stats: ResolveStats) {
+    gradleEmbeddedKotlinModules().forEach { module ->
+        logger.info("Resolving Gradle embedded Kotlin artifacts for ${module.notation()}")
+        resolveGradleEmbeddedLibraryModule(
             project = project,
             stats = stats,
             module = module,
@@ -2858,6 +2879,7 @@ private fun Project.resolveRootDependencyVerificationArtifacts(stats: ResolveSta
     verifyPinnedVerificationMetadataArtifacts(rootProject, stats)
 
     resolveGradleEmbeddedGroovyArtifacts(rootProject, stats)
+    resolveGradleEmbeddedKotlinArtifacts(rootProject, stats)
 
     logger.info("Resolving Gradle ${rootProject.gradle.gradleVersion} source distribution")
     resolveGradleSourceDistribution(rootProject)
